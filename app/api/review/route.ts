@@ -31,8 +31,6 @@ function daysUntilDate(value:string){
 }
 function extractPacket(documents:{name:string;text:string}[]):Packet{
   const t=clean(documents.map(d=>d.text).join("\n"));
-  const lower=t.toLowerCase();
-  const names=documents.map(d=>d.name);
   const w9Docs=documents.filter(d=>/\bw-?9\b/i.test(d.name)||/request for taxpayer identification number|form w-9|w-9/i.test(d.text));
   // Only strong certificate-of-insurance signals classify a document as a COI. Avoid treating a carrier agreement that mentions an "insured" as the insurance source.
   const coiDocs=documents.filter(d=>/\bcoi\b|certificate.*insurance|acord/i.test(d.name)||/certificate of liability insurance|acord 25|certificate of insurance/i.test(d.text));
@@ -68,7 +66,6 @@ function extractPacket(documents:{name:string;text:string}[]):Packet{
   const coiDaysRemaining=expiration?daysUntilDate(expiration):null;
 
   const authorityStatus:"active"|"inactive"|"unknown"="unknown";
-  void lower; void names;
   return {legalName:legal,mc,dot,w9Present,coiPresent,autoLiability:auto,cargoCoverage:cargo,coiDaysRemaining,carrierAgreementPresent,authorityStatus};
 }
 function evaluate(p:Packet){
@@ -77,12 +74,18 @@ function evaluate(p:Packet){
   {label:"Carrier identity",value:identity?"MATCHED":"INCOMPLETE",tone:identity?"pass":"block",detail:identity?`Legal name, MC ${p.mc}, and USDOT ${p.dot} were extracted from the uploaded packet.`:"Legal name, MC number, and USDOT number could not all be extracted from the uploaded packet."},
   {label:"Operating authority",value:p.authorityStatus==="active"?"ACTIVE":p.authorityStatus==="inactive"?"INACTIVE":"CHECK REQUIRED",tone:p.authorityStatus==="active"?"pass":p.authorityStatus==="inactive"?"block":"warn",detail:p.authorityStatus==="unknown"?"Live FMCSA/SAFER verification is required; CarrierGate does not infer or invent a verification result.":p.authorityStatus==="active"?"Authority verified as active.":"Authority is inactive. Do not activate the carrier."},
   {label:"Auto liability",value:p.autoLiability?`$${Math.round(p.autoLiability/1000)}K`:"NOT FOUND",tone:p.autoLiability>=1000000?"pass":"block",detail:p.autoLiability>=1000000?"Detected on the uploaded certificate and meets the configured $1,000,000 minimum.":"Insurance coverage was not found on the uploaded COI or is below the configured $1,000,000 minimum."},
-  {label:"Cargo coverage",value:p.cargoCoverage?`$${Math.round(p.cargoCoverage/1000)}K`:"NOT FOUND",tone:p.cargoCoverage>=100000?"pass":"block",detail:p.cargoCoverage>=100000?"Detected on the uploaded certificate and meets the configured $100,000 minimum.":"Cargo coverage was not found on the uploaded COI or is below the configured $100,000 minimum."},
+  {label:"Cargo coverage",value:p.cargoCoverage?`$${Math.round(p.cargoCoverage/1000)}K`:"NOT FOUND",tone:p.cargoCoverage>=100000?"pass":"block",detail:p.cargoCoverage>=100000?"Detected on the uploaded certificate and meets the configured $100,000 minimum.":"Cargo coverage was not found on the uploaded COI. Minimum required: $100,000."},
   {label:"COI expiration",value:!p.coiPresent?"MISSING":p.coiDaysRemaining===null?"NOT FOUND":`${p.coiDaysRemaining} DAYS`,tone:!p.coiPresent||p.coiDaysRemaining===null||p.coiDaysRemaining<=0?"block":p.coiDaysRemaining<=30?"warn":"pass",detail:!p.coiPresent?"Certificate of insurance is missing.":p.coiDaysRemaining===null?"A COI was uploaded, but an actual expiration date could not be extracted.":p.coiDaysRemaining<=0?"Certificate appears expired.":p.coiDaysRemaining<=30?"Renewal follow-up should start now.":"Certificate remains within the configured validity window."},
   {label:"Required documents",value:p.w9Present&&p.coiPresent&&p.carrierAgreementPresent?"COMPLETE":"INCOMPLETE",tone:p.w9Present&&p.coiPresent&&p.carrierAgreementPresent?"pass":"block",detail:p.w9Present&&p.coiPresent&&p.carrierAgreementPresent?"W-9, COI, and carrier agreement are present.":`Missing: ${[!p.w9Present?"W-9":"",!p.coiPresent?"COI":"",!p.carrierAgreementPresent?"carrier agreement":""].filter(Boolean).join(", ")}.`}
  ];
  const blockers=checks.filter(c=>c.tone==="block").length,warnings=checks.filter(c=>c.tone==="warn").length;
- return {checks,blockers,warnings,status:blockers?"REVIEW":warnings?"REVIEW":"PASS",readiness:Math.max(0,Math.min(100,100-blockers*22-warnings*8)),nextStep:blockers?`Resolve ${blockers} blocking ${blockers===1?"exception":"exceptions"} before activation`:warnings?"Complete the remaining verification checks before activation":"Approve the carrier or continue with your broker activation workflow"};
+ const actionCount=blockers+warnings;
+ const nextStep=blockers
+   ? `Resolve ${blockers} blocking ${blockers===1?"exception":"exceptions"}${warnings?` and complete ${warnings} verification ${warnings===1?"check":"checks"}`:""} before activation`
+   : warnings
+     ? `Complete ${warnings} verification ${warnings===1?"check":"checks"} before activation`
+     : "Approve the carrier or continue with your broker activation workflow";
+ return {checks,blockers,warnings,actionCount,status:blockers?"REVIEW":warnings?"REVIEW":"PASS",readiness:Math.max(0,Math.min(100,100-blockers*22-warnings*8)),nextStep};
 }
 function extractJson(text:string){const c=text.replace(/```json/gi,"").replace(/```/g,"").trim(),s=c.indexOf("{"),e=c.lastIndexOf("}");if(s<0||e<=s)throw new Error("No JSON");return JSON.parse(c.slice(s,e+1));}
 
@@ -104,8 +107,8 @@ export async function POST(request:Request){
   packet=extractPacket(documents); source="uploaded carrier PDFs + deterministic rules";
  }catch(error){return NextResponse.json({error:error instanceof Error?error.message:"Unable to process packet"},{status:400});}
  const evaluated=evaluate(packet); const key=process.env.OPENROUTER_API_KEY;
- if(!key)return NextResponse.json({...evaluated,summary:`CarrierGate analyzed ${extractedFiles.length} uploaded document(s) and found ${evaluated.blockers} blocking exception(s) and ${evaluated.warnings} warning(s).`,ai:false,source,extractedFiles});
- const prompt=`You are CarrierGate, a freight carrier compliance operations agent. Write a concise operations brief from this uploaded-document evaluation. Never change, invent, or downgrade deterministic results. Return ONLY JSON with summary and nextStep. Evaluation: ${JSON.stringify(evaluated)}. Documents: ${JSON.stringify(extractedFiles)}. Mention live FMCSA verification when authority is unknown. Do not provide legal advice.`;
- try{const r=await fetch("https://openrouter.ai/api/v1/chat/completions",{method:"POST",headers:{Authorization:`Bearer ${key}`,"Content-Type":"application/json","HTTP-Referer":"https://swiftlabor-carrier-compliance.vercel.app","X-Title":"SwiftLabor CarrierGate"},body:JSON.stringify({model:"openrouter/free",messages:[{role:"user",content:prompt}],temperature:.1})});if(!r.ok)throw new Error();const d=await r.json(),ai=extractJson(d?.choices?.[0]?.message?.content||"");return NextResponse.json({...evaluated,summary:typeof ai.summary==="string"?ai.summary:`${evaluated.blockers} blocking exception(s) detected.`,nextStep:typeof ai.nextStep==="string"?ai.nextStep:evaluated.nextStep,ai:true,source:`${source} + OpenRouter`,extractedFiles});}
- catch{return NextResponse.json({...evaluated,summary:`CarrierGate analyzed ${extractedFiles.length} uploaded document(s). ${evaluated.blockers} blocking exception(s) and ${evaluated.warnings} warning(s) remain. AI explanation was unavailable, so the deterministic result was preserved.`,ai:false,source,extractedFiles});}
+ if(!key)return NextResponse.json({...evaluated,summary:`CarrierGate analyzed ${extractedFiles.length} uploaded document(s) and found ${evaluated.blockers} blocking exception(s) and ${evaluated.warnings} verification warning(s).`,ai:false,source,extractedFiles});
+ const prompt=`You are CarrierGate, a freight carrier compliance operations agent. Write a concise operations brief from this uploaded-document evaluation. Never change, invent, or downgrade deterministic results. Return ONLY JSON with summary. Do not return nextStep. Evaluation: ${JSON.stringify(evaluated)}. Documents: ${JSON.stringify(extractedFiles)}. Mention live FMCSA verification when authority is unknown. Do not provide legal advice.`;
+ try{const r=await fetch("https://openrouter.ai/api/v1/chat/completions",{method:"POST",headers:{Authorization:`Bearer ${key}`,"Content-Type":"application/json","HTTP-Referer":"https://swiftlabor-carrier-compliance.vercel.app","X-Title":"SwiftLabor CarrierGate"},body:JSON.stringify({model:"openrouter/free",messages:[{role:"user",content:prompt}],temperature:.1})});if(!r.ok)throw new Error();const d=await r.json(),ai=extractJson(d?.choices?.[0]?.message?.content||"");return NextResponse.json({...evaluated,summary:typeof ai.summary==="string"?ai.summary:`${evaluated.blockers} blocking exception(s) detected.`,ai:true,source:`${source} + OpenRouter`,extractedFiles});}
+ catch{return NextResponse.json({...evaluated,summary:`CarrierGate analyzed ${extractedFiles.length} uploaded document(s). ${evaluated.blockers} blocking exception(s) and ${evaluated.warnings} verification warning(s) remain. AI explanation was unavailable, so the deterministic result was preserved.`,ai:false,source,extractedFiles});}
 }
