@@ -1,8 +1,8 @@
 {
   "name": "swiftlabor-carriergate",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "scripts": {"dev":"next dev","build":"next build","start":"next start","lint":"tsc --noEmit"},
-  "dependencies": {"lucide-react":"latest","next":"latest","react":"latest","react-dom":"latest"},
+  "dependencies": {"lucide-react":"latest","next":"latest","pdf-parse":"^1.1.1","react":"latest","react-dom":"latest"},
   "devDependencies": {"@types/node":"latest","@types/react":"latest","typescript":"latest"}
 }
