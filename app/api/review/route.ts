@@ -29,6 +29,39 @@ function daysUntilDate(value:string){
   const d=parseUsDate(value); if(!d)return null;
   return Math.ceil((d.getTime()-Date.now())/86400000);
 }
+
+async function ocrPdfWithOpenRouter(file:File):Promise<string>{
+  const key=process.env.OPENROUTER_API_KEY;
+  if(!key) throw new Error(`${file.name} is scanned/image-only and OCR is not configured. Add OPENROUTER_API_KEY to enable scanned-PDF OCR.`);
+  const bytes=Buffer.from(await file.arrayBuffer());
+  const dataUrl=`data:application/pdf;base64,${bytes.toString("base64")}`;
+  const r=await fetch("https://openrouter.ai/api/v1/chat/completions",{
+    method:"POST",
+    headers:{Authorization:`Bearer ${key}`,"Content-Type":"application/json","HTTP-Referer":"https://swiftlabor-carrier-compliance.vercel.app","X-Title":"SwiftLabor CarrierGate"},
+    body:JSON.stringify({
+      model:"google/gemini-2.5-flash-lite",
+      messages:[{role:"user",content:[
+        {type:"text",text:"Transcribe this PDF for a carrier-compliance extraction pipeline. Return ONLY the text that is visibly present in the document. Preserve company names, MC numbers, USDOT numbers, dates, coverage amounts, policy numbers, and labels exactly as shown. Do not infer, normalize, complete, or invent missing values. If a value is unreadable, omit it."},
+        {type:"file",file:{filename:file.name,file_data:dataUrl}}
+      ]}],
+      plugins:[{id:"file-parser",pdf:{engine:"mistral-ocr"}}],
+      temperature:0,
+      max_tokens:12000
+    })
+  });
+  if(!r.ok){
+    const body=await r.text().catch(()=>"");
+    throw new Error(`OCR failed for ${file.name} (${r.status}). ${body.slice(0,240)}`);
+  }
+  const data=await r.json();
+  const message=data?.choices?.[0]?.message;
+  const annotationText=(message?.annotations||[]).flatMap((a:any)=>a?.type==="file"?((a.file?.content||[]).filter((x:any)=>x?.type==="text").map((x:any)=>x.text)):[]).join("\n").trim();
+  const answer=typeof message?.content==="string"?message.content.trim():"";
+  const text=annotationText||answer;
+  if(!text) throw new Error(`OCR returned no readable text for ${file.name}.`);
+  return text;
+}
+
 function extractPacket(documents:{name:string;text:string}[]):Packet{
   const t=clean(documents.map(d=>d.text).join("\n"));
   const w9Docs=documents.filter(d=>/\bw-?9\b/i.test(d.name)||/request for taxpayer identification number|form w-9|w-9/i.test(d.text));
@@ -90,7 +123,7 @@ function evaluate(p:Packet){
 function extractJson(text:string){const c=text.replace(/```json/gi,"").replace(/```/g,"").trim(),s=c.indexOf("{"),e=c.lastIndexOf("}");if(s<0||e<=s)throw new Error("No JSON");return JSON.parse(c.slice(s,e+1));}
 
 export async function POST(request:Request){
- let packet:Packet|null=null,source="",extractedFiles:string[]=[],documents:{name:string;text:string}[]=[];
+ let packet:Packet|null=null,source="",extractedFiles:string[]=[],documents:{name:string;text:string}[]=[],ocrFiles:string[]=[];
  try{
   const ct=request.headers.get("content-type")||"";
   if(!ct.includes("multipart/form-data"))return NextResponse.json({error:"Upload one or more PDF documents to start a CarrierGate review."},{status:400});
@@ -101,14 +134,20 @@ export async function POST(request:Request){
    if(file.size>8000000)throw new Error(`${file.name} is larger than the 8 MB limit.`);
    if(file.type!=="application/pdf"&&!file.name.toLowerCase().endsWith(".pdf"))throw new Error(`${file.name}: PDF files only.`);
    const parsed=await pdf(Buffer.from(await file.arrayBuffer())); const text=parsed.text?.trim()||"";
-   if(!text)throw new Error(`${file.name} appears to be scanned/image-only. CarrierGate currently supports text-based PDFs; OCR support can be added separately.`);
-   documents.push({name:file.name,text}); extractedFiles.push(file.name);
+   if(text){
+     documents.push({name:file.name,text});
+   }else{
+     const ocrText=await ocrPdfWithOpenRouter(file);
+     documents.push({name:file.name,text:ocrText});
+     ocrFiles.push(file.name);
+   }
+   extractedFiles.push(file.name);
   }
-  packet=extractPacket(documents); source="uploaded carrier PDFs + deterministic rules";
+  packet=extractPacket(documents); source=ocrFiles.length?`uploaded carrier PDFs + deterministic rules + OCR (${ocrFiles.length} scanned document${ocrFiles.length===1?"":"s"})`:"uploaded carrier PDFs + deterministic rules";
  }catch(error){return NextResponse.json({error:error instanceof Error?error.message:"Unable to process packet"},{status:400});}
  const evaluated=evaluate(packet); const key=process.env.OPENROUTER_API_KEY;
- if(!key)return NextResponse.json({...evaluated,summary:`CarrierGate analyzed ${extractedFiles.length} uploaded document(s) and found ${evaluated.blockers} blocking exception(s) and ${evaluated.warnings} verification warning(s).`,ai:false,source,extractedFiles});
- const prompt=`You are CarrierGate, a freight carrier compliance operations agent. Write a concise operations brief from this uploaded-document evaluation. Never change, invent, or downgrade deterministic results. Return ONLY JSON with summary. Do not return nextStep. Evaluation: ${JSON.stringify(evaluated)}. Documents: ${JSON.stringify(extractedFiles)}. Mention live FMCSA verification when authority is unknown. Do not provide legal advice.`;
- try{const r=await fetch("https://openrouter.ai/api/v1/chat/completions",{method:"POST",headers:{Authorization:`Bearer ${key}`,"Content-Type":"application/json","HTTP-Referer":"https://swiftlabor-carrier-compliance.vercel.app","X-Title":"SwiftLabor CarrierGate"},body:JSON.stringify({model:"openrouter/free",messages:[{role:"user",content:prompt}],temperature:.1})});if(!r.ok)throw new Error();const d=await r.json(),ai=extractJson(d?.choices?.[0]?.message?.content||"");return NextResponse.json({...evaluated,summary:typeof ai.summary==="string"?ai.summary:`${evaluated.blockers} blocking exception(s) detected.`,ai:true,source:`${source} + OpenRouter`,extractedFiles});}
- catch{return NextResponse.json({...evaluated,summary:`CarrierGate analyzed ${extractedFiles.length} uploaded document(s). ${evaluated.blockers} blocking exception(s) and ${evaluated.warnings} verification warning(s) remain. AI explanation was unavailable, so the deterministic result was preserved.`,ai:false,source,extractedFiles});}
+ if(!key)return NextResponse.json({...evaluated,summary:`CarrierGate analyzed ${extractedFiles.length} uploaded document(s) and found ${evaluated.blockers} blocking exception(s) and ${evaluated.warnings} verification warning(s).`,ai:false,source,extractedFiles,ocrFiles});
+ const prompt=`You are CarrierGate, a freight carrier compliance operations agent. Write a concise operations brief from this uploaded-document evaluation. Never change, invent, or downgrade deterministic results. Return ONLY JSON with summary. Do not return nextStep. Evaluation: ${JSON.stringify(evaluated)}. Documents: ${JSON.stringify(extractedFiles)}. OCR documents: ${JSON.stringify(ocrFiles)}. Mention live FMCSA verification when authority is unknown. Do not provide legal advice.`;
+ try{const r=await fetch("https://openrouter.ai/api/v1/chat/completions",{method:"POST",headers:{Authorization:`Bearer ${key}`,"Content-Type":"application/json","HTTP-Referer":"https://swiftlabor-carrier-compliance.vercel.app","X-Title":"SwiftLabor CarrierGate"},body:JSON.stringify({model:"openrouter/free",messages:[{role:"user",content:prompt}],temperature:.1})});if(!r.ok)throw new Error();const d=await r.json(),ai=extractJson(d?.choices?.[0]?.message?.content||"");return NextResponse.json({...evaluated,summary:typeof ai.summary==="string"?ai.summary:`${evaluated.blockers} blocking exception(s) detected.`,ai:true,source:`${source} + OpenRouter`,extractedFiles,ocrFiles});}
+ catch{return NextResponse.json({...evaluated,summary:`CarrierGate analyzed ${extractedFiles.length} uploaded document(s). ${evaluated.blockers} blocking exception(s) and ${evaluated.warnings} verification warning(s) remain. AI explanation was unavailable, so the deterministic result was preserved.`,ai:false,source,extractedFiles,ocrFiles});}
 }
